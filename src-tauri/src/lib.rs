@@ -638,10 +638,23 @@ fn run_ps_with_env(script: &str, extra_env: &[(String, String)]) -> Result<Strin
 
 fn gateway_ready_from_status(status: &str) -> bool {
     let s = status.to_lowercase();
+    if s.contains("not ready")
+        || s.contains("stopped")
+        || s.contains("not running")
+        || s.contains("failed")
+        || s.contains("error")
+    {
+        return false;
+    }
     s.contains("connectivity probe: ok")
         || s.contains("listener detected")
         || s.contains("runtime: running")
         || s.contains("gateway: running")
+        || s.contains("status: running")
+        || s.contains("gateway is running")
+        || s.contains("gateway is ready")
+        || s.contains("listening on")
+        || s.contains("ready")
 }
 
 fn gateway_status_output() -> Result<String, String> {
@@ -812,9 +825,7 @@ for ($i = 0; $i -lt 6; $i++) {
         $cmdLine = [string]$proc.CommandLine
         $name = [string]$proc.Name
         $isOpenClawListener = $cmdLine -match '(?i)openclaw'
-        $isOpenClawListener = $isOpenClawListener -or ($cmdLine -match '(?i)\bgateway\b' -and $cmdLine -match '(?i)\bnode(\.exe)?\b')
         $isOpenClawListener = $isOpenClawListener -or ($name -match '(?i)^openclaw(\.exe)?$')
-        $isOpenClawListener = $isOpenClawListener -or ($name -match '(?i)^node(\.exe)?$' -and [string]::IsNullOrWhiteSpace($cmdLine))
         if ($isOpenClawListener) {
             Stop-Process -Id $ownerPid -Force -EA SilentlyContinue
             [void]$out.Add("Killed OpenClaw gateway listener PID $ownerPid on port $port")
@@ -849,7 +860,6 @@ if ($out.Count -gt 0) {
 
 fn restart_openclaw_gateway() -> Result<String, String> {
     let stopped = stop_openclaw_gateway()?;
-    let repaired = repair_openclaw_gateway_configs()?;
     let env = configured_openclaw_env();
     let pid = spawn_cmd_owned_env("openclaw", &["gateway", "run"], &env)?;
     thread::sleep(Duration::from_millis(1800));
@@ -862,8 +872,8 @@ fn restart_openclaw_gateway() -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "{}\n{}\nrestarted openclaw gateway pid {}",
-        stopped, repaired, pid
+        "{}\nrestarted openclaw gateway pid {}",
+        stopped, pid
     ))
 }
 
@@ -1900,11 +1910,28 @@ fn repair_openclaw_config_value(config: &mut serde_json::Value, openclaw_base: O
         gateway["mode"] = serde_json::json!("local");
     }
     let auth = ensure_json_object_at(gateway, "auth");
-    if string_missing_or_empty(auth, "mode") {
-        auth["mode"] = serde_json::json!("token");
+    let token_is_string = auth.get("token").map(|v| v.is_string()).unwrap_or(false);
+    let has_token = auth
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !token_is_string {
+        if let Some(auth_obj) = auth.as_object_mut() {
+            auth_obj.remove("token");
+        }
     }
-    if !auth.get("token").map(|v| v.is_string()).unwrap_or(false) {
-        auth["token"] = serde_json::json!("");
+    if string_missing_or_empty(auth, "mode") {
+        auth["mode"] = serde_json::json!(if has_token { "token" } else { "none" });
+    } else if auth
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|mode| mode.eq_ignore_ascii_case("token"))
+        .unwrap_or(false)
+        && !has_token
+    {
+        auth["mode"] = serde_json::json!("none");
     }
     if string_missing_or_empty(gateway, "bind") {
         gateway["bind"] = serde_json::json!("lan");
@@ -2458,10 +2485,9 @@ fn run_action(action: String) -> Result<String, String> {
     match a.as_str() {
         "gateway-run" => {
             ensure_installed("openclaw", "OpenClaw")?;
-            let repaired = repair_openclaw_gateway_configs()?;
-            let _ = sync_configured_openclaw_auth_profiles()?;
             let env = configured_openclaw_env();
-            spawn_cmd_owned_env("openclaw", &["gateway", "run"], &env).map(|pid| format!("{}\nstarted openclaw gateway run pid {}", repaired, pid))
+            spawn_cmd_owned_env("openclaw", &["gateway", "run"], &env)
+                .map(|pid| format!("started openclaw gateway run pid {}", pid))
         }
         "gateway-stop" => {
             ensure_installed("openclaw", "OpenClaw")?;
@@ -2473,8 +2499,6 @@ fn run_action(action: String) -> Result<String, String> {
         }
         "webui-run" => {
             ensure_installed("openclaw", "OpenClaw")?;
-            let repaired = repair_openclaw_gateway_configs()?;
-            let _ = sync_configured_openclaw_auth_profiles()?;
             let env = configured_openclaw_env();
             let gateway_running = gateway_status_output()
                 .map(|status| gateway_ready_from_status(&status))
@@ -2483,7 +2507,7 @@ fn run_action(action: String) -> Result<String, String> {
                 let _ = spawn_cmd_owned_env("openclaw", &["gateway", "run"], &env)?;
                 thread::sleep(Duration::from_secs(2));
             }
-            open_openclaw_dashboard(&env).map(|out| format!("{}\n{}", repaired, out))
+            open_openclaw_dashboard(&env)
         }
         "doctor" => {
             let repaired = repair_openclaw_gateway_configs()?;
